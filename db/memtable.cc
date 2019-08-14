@@ -574,6 +574,122 @@ bool MemTable::Add(SequenceNumber s, ValueType type,
   return true;
 }
 
+bool MemTable::AddWithHint(SequenceNumber s, ValueType type,
+                   const Slice& key, /* user key */
+                   const Slice& value, bool allow_concurrent,
+                   MemTablePostProcessInfo* post_process_info,
+                   void** hint) {
+  // Format of an entry is concatenation of:
+  //  key_size     : varint32 of internal_key.size()
+  //  key bytes    : char[internal_key.size()]
+  //  value_size   : varint32 of value.size()
+  //  value bytes  : char[value.size()]
+  uint32_t key_size = static_cast<uint32_t>(key.size());
+  uint32_t val_size = static_cast<uint32_t>(value.size());
+  uint32_t internal_key_size = key_size + 8;
+  const uint32_t encoded_len = VarintLength(internal_key_size) +
+                               internal_key_size + VarintLength(val_size) +
+                               val_size;
+  char* buf = nullptr;
+  std::unique_ptr<MemTableRep>& table =
+      type == kTypeRangeDeletion ? range_del_table_ : table_;
+  KeyHandle handle = table->Allocate(encoded_len, &buf);
+
+  char* p = EncodeVarint32(buf, internal_key_size);
+  memcpy(p, key.data(), key_size);
+  Slice key_slice(p, key_size);
+  p += key_size;
+  uint64_t packed = PackSequenceAndType(s, type);
+  EncodeFixed64(p, packed);
+  p += 8;
+  p = EncodeVarint32(p, val_size);
+  memcpy(p, value.data(), val_size);
+  assert((unsigned)(p + val_size - buf) == (unsigned)encoded_len);
+  if (!allow_concurrent) {
+    // Extract prefix for insert with hint.
+    if (insert_with_hint_prefix_extractor_ != nullptr &&
+        insert_with_hint_prefix_extractor_->InDomain(key_slice)) {
+      // std::cout << "Memtable Add With Hint Non Concurrent With Hint! " << std::endl; 
+      Slice prefix = insert_with_hint_prefix_extractor_->Transform(key_slice);
+      bool res = table->InsertKeyWithHint(handle, &insert_hints_[prefix]);
+      if (UNLIKELY(!res)) {
+        return res;
+      }
+    } else {
+      // std::cout << "Memtable Add With Hint Non Concurrent Without Hint! " << (uint64_t) (*hint) << std::endl; 
+      bool res = table->InsertKeyWithHint(handle, hint);
+      if (UNLIKELY(!res)) {
+        return res;
+      }
+    }
+
+    // this is a bit ugly, but is the way to avoid locked instructions
+    // when incrementing an atomic
+    num_entries_.store(num_entries_.load(std::memory_order_relaxed) + 1,
+                       std::memory_order_relaxed);
+    data_size_.store(data_size_.load(std::memory_order_relaxed) + encoded_len,
+                     std::memory_order_relaxed);
+    if (type == kTypeDeletion) {
+      num_deletes_.store(num_deletes_.load(std::memory_order_relaxed) + 1,
+                         std::memory_order_relaxed);
+    }
+
+    if (prefix_bloom_ && prefix_extractor_->InDomain(key)) {
+      assert(prefix_extractor_);
+      prefix_bloom_->Add(prefix_extractor_->Transform(key));
+    }
+
+    // The first sequence number inserted into the memtable
+    assert(first_seqno_ == 0 || s >= first_seqno_);
+    if (first_seqno_ == 0) {
+      first_seqno_.store(s, std::memory_order_relaxed);
+
+      if (earliest_seqno_ == kMaxSequenceNumber) {
+        earliest_seqno_.store(GetFirstSequenceNumber(),
+                              std::memory_order_relaxed);
+      }
+      assert(first_seqno_.load() >= earliest_seqno_.load());
+    }
+    assert(post_process_info == nullptr);
+    UpdateFlushState();
+  } else {
+    // std::cout << "Memtable Add With Hint With Hint Add Concurrent! " << (uint64_t) (*hint) << std::endl; 
+    bool res = table->InsertKeyWithHintConcurrently(handle, hint);
+    if (UNLIKELY(!res)) {
+      return res;
+    }
+
+    assert(post_process_info != nullptr);
+    post_process_info->num_entries++;
+    post_process_info->data_size += encoded_len;
+    if (type == kTypeDeletion) {
+      post_process_info->num_deletes++;
+    }
+
+    if (prefix_bloom_ && prefix_extractor_->InDomain(key)) {
+      assert(prefix_extractor_);
+      prefix_bloom_->AddConcurrently(prefix_extractor_->Transform(key));
+    }
+
+    // atomically update first_seqno_ and earliest_seqno_.
+    uint64_t cur_seq_num = first_seqno_.load(std::memory_order_relaxed);
+    while ((cur_seq_num == 0 || s < cur_seq_num) &&
+           !first_seqno_.compare_exchange_weak(cur_seq_num, s)) {
+    }
+    uint64_t cur_earliest_seqno =
+        earliest_seqno_.load(std::memory_order_relaxed);
+    while (
+        (cur_earliest_seqno == kMaxSequenceNumber || s < cur_earliest_seqno) &&
+        !first_seqno_.compare_exchange_weak(cur_earliest_seqno, s)) {
+    }
+  }
+  if (is_range_del_table_empty_ && type == kTypeRangeDeletion) {
+    is_range_del_table_empty_ = false;
+  }
+  UpdateOldestKeyTime();
+  return true;
+}
+
 // Callback from MemTable::Get()
 namespace {
 

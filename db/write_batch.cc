@@ -40,6 +40,8 @@
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
+#include <iostream>
+#include <unordered_map>
 
 #include "db/column_family.h"
 #include "db/db_impl.h"
@@ -1073,6 +1075,8 @@ class MemTableInserter : public WriteBatch::Handler {
   DupDetector       duplicate_detector_;
   bool              dup_dectector_on_;
 
+  std::unordered_map<MemTable*, void*> hint_;
+
   MemPostInfoMap& GetPostMap() {
     assert(concurrent_memtable_writes_);
     if(!post_info_created_) {
@@ -1251,8 +1255,8 @@ class MemTableInserter : public WriteBatch::Handler {
     assert(!seq_per_batch_ || !moptions->inplace_update_support);
     if (!moptions->inplace_update_support) {
       bool mem_res =
-          mem->Add(sequence_, value_type, key, value,
-                   concurrent_memtable_writes_, get_post_process_info(mem));
+          mem->AddWithHint(sequence_, value_type, key, value,
+                   concurrent_memtable_writes_, get_post_process_info(mem), &hint_[mem]);
       if (UNLIKELY(!mem_res)) {
         assert(seq_per_batch_);
         ret_status = Status::TryAgain("key+seq exists");
@@ -1329,13 +1333,13 @@ class MemTableInserter : public WriteBatch::Handler {
     return PutCFImpl(column_family_id, key, value, kTypeValue);
   }
 
-  Status DeleteImpl(uint32_t /*column_family_id*/, const Slice& key,
+  Status DeleteImpl(uint32_t /* column_family_id */, const Slice& key,
                     const Slice& value, ValueType delete_type) {
     Status ret_status;
     MemTable* mem = cf_mems_->GetMemTable();
     bool mem_res =
-        mem->Add(sequence_, delete_type, key, value,
-                 concurrent_memtable_writes_, get_post_process_info(mem));
+        mem->AddWithHint(sequence_, delete_type, key, value,
+                 concurrent_memtable_writes_, get_post_process_info(mem), &hint_[mem]);
     if (UNLIKELY(!mem_res)) {
       assert(seq_per_batch_);
       ret_status = Status::TryAgain("key+seq exists");
